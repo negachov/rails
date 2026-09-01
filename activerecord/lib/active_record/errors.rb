@@ -601,6 +601,12 @@ module ActiveRecord
   class ConnectionFailed < QueryAborted
   end
 
+  class AdvisoryLockAcquisitionFailed < ActiveRecordError
+  end
+
+  class AdvisoryLockLost < ActiveRecordError
+  end
+
   # UnknownAttributeReference is raised when an unknown and potentially unsafe
   # value is passed to a query method. For example, passing a non column name
   # value to a relation's #order method might cause this exception.

@@ -1,3 +1,39 @@
+*   Raise an error when an advisory lock's session is lost, and add a helper
+    that detects a lock silently dropped when the connection is re-established
+    on a different backend.
+
+    Advisory locks are scoped to the database session, not the Rails adapter
+    object. If the session was lost while the lock was held, the next advisory
+    lock call could be transparently (re)connected and acquire/release the lock
+    on a *different* backend, silently breaking the mutual exclusion the lock
+    is supposed to provide. This is fixed in three layers:
+
+    * `get_advisory_lock` and `release_advisory_lock` no longer retry on a
+      connection error: they pass `allow_retry: false` to `query_value` (which
+      defaults to `allow_retry: true`), so a statement that fails is not
+      re-run on a *new* backend.
+    * Both methods probe the session (`active?`) before running the lock call
+      and raise `ConnectionNotEstablished` if the session is gone, restoring
+      the Rails 6 behavior where a lost connection surfaces to the caller
+      instead of being silently re-established. A not-yet-established
+      connection is unaffected and connects lazily, like any other first query.
+    * `ActiveRecord.with_session_advisory_lock(lock_name_or_id) { ... }` records
+      the server-side session identifier (`pg_backend_pid` / `CONNECTION_ID`)
+      when the lock is acquired and verifies it is still the same when the
+      lock is released. This catches the case the adapter-level guard cannot:
+      a *normal* query (not an advisory lock call) reconnecting while the lock
+      is held. If the session changed, the helper raises `AdvisoryLockLost` so
+      the caller knows the critical section did not run under a held lock.
+
+    The helper raises `AdvisoryLockAcquisitionFailed` when the lock cannot be
+    acquired, yields without locking on adapters where advisory locks are
+    unsupported or disabled (`advisory_locks: false`), and accepts `timeout:`
+    (MySQL) and `connection:` (multi-database) options. A lost lock never masks
+    an exception already propagating from the block: in that case it is logged
+    as a warning instead of being raised.
+
+    *Mutsutoshi Yoshimoto*
+
 *   Deprecate `ActiveRecord::ConnectionAdapters::DatabaseStatements#create`
     in favor of `#insert`.
 

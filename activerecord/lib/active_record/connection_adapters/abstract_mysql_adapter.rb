@@ -193,11 +193,13 @@ module ActiveRecord
       end
 
       def get_advisory_lock(lock_name, timeout = 0) # :nodoc:
-        query_value("SELECT GET_LOCK(#{quote(lock_name.to_s)}, #{timeout})", nil, materialize_transactions: true) == 1
+        ensure_advisory_lock_session!
+        query_value("SELECT GET_LOCK(#{quote(lock_name.to_s)}, #{timeout})", nil, allow_retry: false, materialize_transactions: true) == 1
       end
 
       def release_advisory_lock(lock_name) # :nodoc:
-        query_value("SELECT RELEASE_LOCK(#{quote(lock_name.to_s)})", nil, materialize_transactions: true) == 1
+        ensure_advisory_lock_session!
+        query_value("SELECT RELEASE_LOCK(#{quote(lock_name.to_s)})", nil, allow_retry: false, materialize_transactions: true) == 1
       end
 
       def index_algorithms

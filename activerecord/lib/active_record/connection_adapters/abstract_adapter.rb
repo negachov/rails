@@ -682,6 +682,12 @@ module ActiveRecord
         supports_advisory_locks? && @advisory_locks_enabled
       end
 
+      def ensure_advisory_lock_session! # :nodoc:
+        if @raw_connection && !active?
+          raise ConnectionNotEstablished, "The connection is not active"
+        end
+      end
+
       # This is meant to be implemented by the adapters that support advisory
       # locks
       #
