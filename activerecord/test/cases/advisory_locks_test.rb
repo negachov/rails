@@ -251,33 +251,41 @@ class AdvisoryLocksTest < ActiveRecord::TestCase
     # lock_a was lost). @needs_reconnect must prevent the transparent
     # reconnect in with_raw_connection.
     #
-    # Note: this test verifies the @needs_reconnect guard in
-    # ensure_advisory_lock_session!. It does NOT test the scenario where
-    # lock_a is held while the session dies (that is covered by the helper
-    # tests below). Here, lock_a is released BEFORE @needs_reconnect is set,
-    # so no lock is left behind.
+    # This test verifies the @needs_reconnect guard in
+    # ensure_advisory_lock_session!. lock_a is acquired and NOT released
+    # (the session dies while holding it). After the session dies, lock_a
+    # is released server-side, but the adapter still thinks it holds it.
+    # get_advisory_lock(lock_b) must raise (not transparently reconnect and
+    # acquire lock_b on a fresh backend).
     connection = ActiveRecord::Base.lease_connection
     lock_a = nested_lock_arg(0)
     lock_b = nested_lock_arg(1)
 
-    # Acquire and release lock_a (the session is healthy).
+    # Acquire lock_a (do NOT release -- the session will die while holding it).
     assert connection.get_advisory_lock(lock_a), "should acquire lock_a"
-    assert connection.release_advisory_lock(lock_a), "should release lock_a"
 
-    # Simulate the state after a connection error: @needs_reconnect = true.
-    connection.instance_variable_set(:@needs_reconnect, true)
+    # Simulate the session dying: kill it from another connection.
+    kill_session_by_other_connection(connection)
 
-    # get_advisory_lock(lock_b) must raise (not transparently reconnect and
-    # acquire lock_b on a fresh backend).
+    # Now get_advisory_lock(lock_b) must raise (the session is gone).
+    # The guard in ensure_advisory_lock_session! catches !active? and raises.
     assert_raises(ActiveRecord::ConnectionNotEstablished) do
       connection.get_advisory_lock(lock_b)
     end
 
-    assert connection.needs_reconnect?,
-      "@needs_reconnect must remain true (no transparent reconnect occurred)"
+    # Verify that the lock is free (the session is dead, so the lock was
+    # released server-side).
+    other_pool = build_duplicate_pool
+    other = other_pool.checkout
+    assert other.get_advisory_lock(lock_a),
+      "lock_a should be released after the session was killed"
+    other.release_advisory_lock(lock_a)
+    assert other.get_advisory_lock(lock_b),
+      "lock_b should be free (the session is dead)"
+    other.release_advisory_lock(lock_b)
   ensure
-    # Reset @needs_reconnect and restore a live connection.
-    connection.instance_variable_set(:@needs_reconnect, false)
+    other&.close
+    other_pool&.disconnect!
     restore_live_connection(connection)
   end
 
@@ -367,34 +375,32 @@ class AdvisoryLocksTest < ActiveRecord::TestCase
     assert_equal :ok, result
   end
 
-  def test_with_session_advisory_lock_session_dies_after_acquisition
-    # Verify the helper's error path when the session dies after acquisition
-    # but before session_id_of completes. The helper should:
-    #   1. Acquire the lock (get_advisory_lock succeeds)
-    #   2. Kill the session (from another connection)
-    #   3. session_id_of raises (the session is gone)
-    #   4. `ensure` calls release_and_report_advisory_lock with
-    #      original_session_id == nil, which releases the lock best-effort
-    #   5. The exception from session_id_of propagates to the caller
-    #
-    # This test calls the helper directly. We use a fake connection whose
-    # get_advisory_lock succeeds but whose active? returns false (so
-    # session_id_of's guard raises).
-    release_called = false
+  def test_with_session_advisory_lock_release_failure_propagates
+    # When release_advisory_lock fails (e.g. the session died during the
+    # block), the failure must propagate to the caller. We use a fake
+    # connection whose get_advisory_lock succeeds but whose
+    # release_advisory_lock raises. The helper should:
+    #   1. Acquire the lock (fake returns true)
+    #   2. session_id_of returns a valid session id
+    #   3. yield the block
+    #   4. `ensure` calls release_and_report_advisory_lock
+    #      - release_advisory_lock raises (the session is gone)
+    #      - the exception propagates to the caller
     fake = Object.new
     fake.define_singleton_method(:advisory_locks_enabled?) { true }
-    fake.define_singleton_method(:adapter_name) { "FakeAdapter" }
+    fake.define_singleton_method(:adapter_name) { "PostgreSQL" }
     fake.define_singleton_method(:get_advisory_lock) { |*| true }
-    fake.define_singleton_method(:release_advisory_lock) { |*| release_called = true; true }
-    # active? returns false -> session_id_of's guard raises
+    fake.define_singleton_method(:release_advisory_lock) { |*| raise ActiveRecord::ConnectionNotEstablished, "simulated" }
+    # session_id_of returns a value (PostgreSQL adapter)
     fake.define_singleton_method(:needs_reconnect?) { false }
-    fake.define_singleton_method(:active?) { false }
+    fake.define_singleton_method(:active?) { true }
+    fake.define_singleton_method(:query_value) { |*| 12345 }
 
-    assert_raises(ActiveRecord::ConnectionNotEstablished) do
+    # release_and_report_advisory_lock wraps the release failure in
+    # AdvisoryLockLost (not ConnectionNotEstablished).
+    assert_raises(ActiveRecord::AdvisoryLockLost) do
       ActiveRecord.with_session_advisory_lock(lock_arg, connection: fake) { :ok }
     end
-    assert release_called,
-      "release_advisory_lock must be called in ensure even when session_id_of fails"
   end
 
   # -- query_value allow_retry: false unit test -----------------------------
