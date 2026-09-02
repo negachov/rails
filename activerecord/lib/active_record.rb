@@ -772,11 +772,11 @@ module ActiveRecord
   def self.release_and_report_advisory_lock(connection, lock_name_or_id, original_session_id, propagating) # :nodoc:
     lock_lost_reason = nil
 
-    # If the session id could not be recorded (e.g. the session died just
-    # after acquisition, or the adapter does not support session id
-    # tracking), we cannot detect a session change. Release the lock and
-    # report any failure the same way as the session-id path below.
     if original_session_id.nil?
+      # If the session id could not be recorded (e.g. the session died just
+      # after acquisition, or the adapter does not support session id
+      # tracking), we cannot detect a session change. Release the lock and
+      # report any failure.
       begin
         released = connection.release_advisory_lock(lock_name_or_id)
         unless released
@@ -785,27 +785,27 @@ module ActiveRecord
       rescue ActiveRecord::ConnectionNotEstablished, ActiveRecord::StatementInvalid => e
         lock_lost_reason = "connection is gone while releasing (#{e.class})"
       end
-
-      return if lock_lost_reason.nil?
-    end
-
-    begin
-      current_session_id = session_id_of(connection)
-      if current_session_id != original_session_id
-        lock_lost_reason = "session changed (#{original_session_id} -> #{current_session_id})"
-      end
-    rescue ActiveRecord::ConnectionNotEstablished, ActiveRecord::StatementInvalid => e
-      lock_lost_reason = "connection is gone (#{e.class})"
-    end
-
-    if lock_lost_reason.nil?
+    else
+      # Verify the session is still the same one that held the lock.
       begin
-        released = connection.release_advisory_lock(lock_name_or_id)
-        unless released
-          lock_lost_reason = "lock was not released on the same session"
+        current_session_id = session_id_of(connection)
+        if current_session_id != original_session_id
+          lock_lost_reason = "session changed (#{original_session_id} -> #{current_session_id})"
         end
       rescue ActiveRecord::ConnectionNotEstablished, ActiveRecord::StatementInvalid => e
-        lock_lost_reason = "connection is gone while releasing (#{e.class})"
+        lock_lost_reason = "connection is gone (#{e.class})"
+      end
+
+      # If the session is still valid, release the lock.
+      if lock_lost_reason.nil?
+        begin
+          released = connection.release_advisory_lock(lock_name_or_id)
+          unless released
+            lock_lost_reason = "lock was not released on the same session"
+          end
+        rescue ActiveRecord::ConnectionNotEstablished, ActiveRecord::StatementInvalid => e
+          lock_lost_reason = "connection is gone while releasing (#{e.class})"
+        end
       end
     end
 
