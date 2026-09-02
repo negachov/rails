@@ -161,32 +161,38 @@ class AdvisoryLocksTest < ActiveRecord::TestCase
 
   def test_get_advisory_lock_with_needs_reconnect_true
     # When @needs_reconnect is true (set by a previous connection error),
-    # get_advisory_lock must still raise rather than transparently reconnect.
-    # We simulate this by killing the session and then calling get_advisory_lock:
-    # the active? probe fails, and with_raw_connection sees @needs_reconnect == true
-    # (set by the failed probe) and must not reconnect.
+    # get_advisory_lock must raise rather than transparently reconnecting.
+    # This is the case where `active?` may still return true (the raw
+    # connection object is present) but the adapter has flagged itself for
+    # replacement. Without the @needs_reconnect check in
+    # ensure_advisory_lock_session!, with_raw_connection would call verify!
+    # and transparently reconnect, running the advisory lock on a different
+    # backend.
     connection = ActiveRecord::Base.lease_connection
     assert connection.get_advisory_lock(lock_arg), "should acquire the lock"
+    connection.release_advisory_lock(lock_arg)
 
-    kill_session_by_other_connection(connection)
+    # Set @needs_reconnect = true directly to simulate the state after a
+    # previous connection error (e.g. a failed query that was not retried).
+    connection.instance_variable_set(:@needs_reconnect, true)
 
-    # After the kill, the first get_advisory_lock call fails at the active?
-    # probe and sets @needs_reconnect. A second call must also raise
-    # (not silently reconnect and acquire on a fresh backend).
+    # get_advisory_lock must raise (not transparently reconnect and acquire
+    # on a fresh backend), even though active? may still be true.
     assert_raises(ActiveRecord::ConnectionNotEstablished) do
       connection.get_advisory_lock(lock_arg)
     end
 
-    # And a third call must still raise (the connection is still flagged
-    # for reconnect; allow_retry: false prevents the query from being
-    # re-run on a new backend).
+    # release_advisory_lock must also raise.
     assert_raises(ActiveRecord::ConnectionNotEstablished) do
-      connection.get_advisory_lock(lock_arg)
+      connection.release_advisory_lock(lock_arg)
     end
 
-    assert_not connection.active?,
-      "connection must not have been transparently reconnected"
+    # @needs_reconnect should still be true (no reconnect happened).
+    assert connection.needs_reconnect?,
+      "@needs_reconnect must remain true (no transparent reconnect occurred)"
   ensure
+    # Reset @needs_reconnect and restore a live connection.
+    connection.instance_variable_set(:@needs_reconnect, false)
     restore_live_connection(connection)
   end
 

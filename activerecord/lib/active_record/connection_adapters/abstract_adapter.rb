@@ -683,7 +683,17 @@ module ActiveRecord
       end
 
       def ensure_advisory_lock_session! # :nodoc:
-        if @raw_connection && !active?
+        # Raise BEFORE any transparent reconnect can occur. `allow_retry: false`
+        # only prevents re-running a failed query; it does NOT prevent the
+        # pre-execution `connect!` / `verify!` calls in `with_raw_connection`
+        # from reconnecting on a different backend. Both conditions matter:
+        #   - `!active?`: the session is dead (e.g. killed server-side)
+        #   - `@needs_reconnect`: a previous query failed with a connection
+        #     error and the adapter has flagged itself for replacement, but
+        #     the raw connection object is still present. Without this check,
+        #     `with_raw_connection` would call `verify!` and transparently
+        #     reconnect, running the advisory lock on a different backend.
+        if @raw_connection && (!active? || @needs_reconnect)
           raise ConnectionNotEstablished, "The connection is not active"
         end
       end
