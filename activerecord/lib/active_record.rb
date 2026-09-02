@@ -718,7 +718,9 @@ module ActiveRecord
       original_session_id = session_id_of(connection)
 
       yield
-    rescue Exception => raised_error # rubocop:disable Lint/RescueException -- intentionally catch all exceptions (including non-StandardError) to record them as propagating before re-raising
+    # Intentionally catch all exceptions, including non-StandardError, to
+    # record the propagating exception before re-raising it.
+    rescue Exception => raised_error
       propagating = raised_error
       raise
     ensure

@@ -375,6 +375,36 @@ class AdvisoryLocksTest < ActiveRecord::TestCase
     assert_equal :ok, result
   end
 
+  def test_with_session_advisory_lock_on_adapter_without_session_id_release_returns_false
+    # When the adapter does not support session id tracking and
+    # release_advisory_lock returns false, the helper must raise
+    # AdvisoryLockLost (the lock was not released).
+    fake = Object.new
+    fake.define_singleton_method(:advisory_locks_enabled?) { true }
+    fake.define_singleton_method(:adapter_name) { "SQLite" }
+    fake.define_singleton_method(:get_advisory_lock) { |*| true }
+    fake.define_singleton_method(:release_advisory_lock) { |*| false }
+
+    assert_raises(ActiveRecord::AdvisoryLockLost) do
+      ActiveRecord.with_session_advisory_lock(lock_arg, connection: fake) { :ok }
+    end
+  end
+
+  def test_with_session_advisory_lock_on_adapter_without_session_id_release_raises
+    # When the adapter does not support session id tracking and
+    # release_advisory_lock raises a connection error, the helper must raise
+    # AdvisoryLockLost (the lock was not released due to a connection failure).
+    fake = Object.new
+    fake.define_singleton_method(:advisory_locks_enabled?) { true }
+    fake.define_singleton_method(:adapter_name) { "SQLite" }
+    fake.define_singleton_method(:get_advisory_lock) { |*| true }
+    fake.define_singleton_method(:release_advisory_lock) { |*| raise ActiveRecord::ConnectionNotEstablished, "simulated" }
+
+    assert_raises(ActiveRecord::AdvisoryLockLost) do
+      ActiveRecord.with_session_advisory_lock(lock_arg, connection: fake) { :ok }
+    end
+  end
+
   def test_with_session_advisory_lock_release_failure_propagates
     # When release_advisory_lock fails (e.g. the session died during the
     # block), the failure must propagate to the caller. We use a fake
