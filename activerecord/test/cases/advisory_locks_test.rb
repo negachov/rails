@@ -196,6 +196,131 @@ class AdvisoryLocksTest < ActiveRecord::TestCase
     restore_live_connection(connection)
   end
 
+  # -- session_id_of guard --------------------------------------------------
+
+  def test_session_id_of_raises_when_needs_reconnect
+    # session_id_of must raise (not transparently reconnect) when
+    # @needs_reconnect is true. allow_retry: false only prevents re-running
+    # a failed query; it does NOT prevent the pre-execution connect!/verify!
+    # calls in with_raw_connection from reconnecting on a different backend.
+    connection = ActiveRecord::Base.lease_connection
+    connection.instance_variable_set(:@needs_reconnect, true)
+
+    assert_raises(ActiveRecord::ConnectionNotEstablished) do
+      ActiveRecord.send(:session_id_of, connection)
+    end
+  ensure
+    connection.instance_variable_set(:@needs_reconnect, false)
+    restore_live_connection(connection)
+  end
+
+  def test_session_id_of_raises_when_inactive
+    # session_id_of must raise (not transparently reconnect) when the
+    # connection is connected but inactive.
+    connection = ActiveRecord::Base.lease_connection
+    assert connection.get_advisory_lock(lock_arg), "should acquire the lock"
+
+    kill_session_by_other_connection(connection)
+
+    assert_raises(ActiveRecord::ConnectionNotEstablished) do
+      ActiveRecord.send(:session_id_of, connection)
+    end
+  ensure
+    restore_live_connection(connection)
+  end
+
+  def test_session_id_of_returns_nil_for_unknown_adapter
+    # session_id_of returns nil for adapters that do not support session id
+    # tracking (e.g. SQLite). This is not an error state.
+    fake = Object.new
+    fake.define_singleton_method(:adapter_name) { "SQLite" }
+    fake.define_singleton_method(:needs_reconnect?) { false }
+    fake.define_singleton_method(:connected?) { true }
+    fake.define_singleton_method(:active?) { true }
+
+    result = ActiveRecord.send(:session_id_of, fake)
+    assert_nil result, "session_id_of should return nil for unknown adapters"
+  end
+
+  # -- nested get_advisory_lock --------------------------------------------
+
+  def test_nested_get_advisory_lock_raises_when_needs_reconnect
+    # Nested get_advisory_lock: if the session dies while holding lock_a,
+    # and then get_advisory_lock(lock_b) is called, the new session must NOT
+    # silently acquire lock_b (which would break mutual exclusion because
+    # lock_a was lost). @needs_reconnect must prevent the transparent
+    # reconnect in with_raw_connection.
+    connection = ActiveRecord::Base.lease_connection
+    lock_a = nested_lock_arg(0)
+    lock_b = nested_lock_arg(1)
+
+    assert connection.get_advisory_lock(lock_a), "should acquire lock_a"
+    connection.release_advisory_lock(lock_a)
+
+    # Simulate the state after a connection error: @needs_reconnect = true.
+    # This is the case where the session died and the adapter flagged itself
+    # for replacement, but @raw_connection may be nil (disconnect! was called).
+    connection.instance_variable_set(:@needs_reconnect, true)
+
+    # get_advisory_lock(lock_b) must raise (not transparently reconnect and
+    # acquire lock_b on a fresh backend).
+    assert_raises(ActiveRecord::ConnectionNotEstablished) do
+      connection.get_advisory_lock(lock_b)
+    end
+
+    # release_advisory_lock(lock_a) must also raise.
+    assert_raises(ActiveRecord::ConnectionNotEstablished) do
+      connection.release_advisory_lock(lock_a)
+    end
+
+    assert connection.needs_reconnect?,
+      "@needs_reconnect must remain true (no transparent reconnect occurred)"
+  ensure
+    connection.instance_variable_set(:@needs_reconnect, false)
+    restore_live_connection(connection)
+  end
+
+  def test_nested_get_advisory_lock_works_when_connection_is_healthy
+    # Nested get_advisory_lock on a healthy connection: both locks should be
+    # acquired and released successfully. This verifies that the guard does
+    # not over-raise on a healthy connection.
+    connection = ActiveRecord::Base.lease_connection
+    lock_a = nested_lock_arg(0)
+    lock_b = nested_lock_arg(1)
+
+    assert connection.get_advisory_lock(lock_a), "should acquire lock_a"
+    assert connection.get_advisory_lock(lock_b), "should acquire lock_b"
+    assert connection.release_advisory_lock(lock_b), "should release lock_b"
+    assert connection.release_advisory_lock(lock_a), "should release lock_a"
+  end
+
+  def test_nested_get_advisory_lock_releases_when_second_fails
+    # If the second get_advisory_lock fails (e.g. held by another session),
+    # the first lock must still be released. This is the typical cleanup
+    # pattern: ensure { release lock_a } around the acquisition of lock_b.
+    connection = ActiveRecord::Base.lease_connection
+    lock_a = nested_lock_arg(0)
+    lock_b = nested_lock_arg(1)
+
+    # Hold lock_b on a separate session so the main session cannot acquire it.
+    other_pool = build_duplicate_pool
+    other = other_pool.checkout
+    assert other.get_advisory_lock(lock_b), "other session should acquire lock_b"
+
+    # Acquire lock_a on the main session.
+    assert connection.get_advisory_lock(lock_a), "should acquire lock_a"
+
+    # Attempt to acquire lock_b (should fail: held by other session).
+    assert_not connection.get_advisory_lock(lock_b), "should not acquire lock_b"
+
+    # Release lock_a (cleanup).
+    assert connection.release_advisory_lock(lock_a), "should release lock_a"
+  ensure
+    other&.release_advisory_lock(lock_b)
+    other&.close
+    other_pool&.disconnect!
+  end
+
   # -- helper edge cases ----------------------------------------------------
 
   def test_with_session_advisory_lock_releases_lock_when_session_id_fails
@@ -678,6 +803,15 @@ class AdvisoryLocksTest < ActiveRecord::TestCase
         original.call(*args, **kwargs, &block)
       end
       captured
+    end
+
+    # A distinct lock identifier for nested lock tests.
+    def nested_lock_arg(index)
+      if lock_arg.is_a?(Integer)
+        LOCK_ID + index
+      else
+        "#{LOCK_NAME}_#{index}"
+      end
     end
 
     LOCK_ID = 1234_5678

@@ -686,14 +686,32 @@ module ActiveRecord
         # Raise BEFORE any transparent reconnect can occur. `allow_retry: false`
         # only prevents re-running a failed query; it does NOT prevent the
         # pre-execution `connect!` / `verify!` calls in `with_raw_connection`
-        # from reconnecting on a different backend. Both conditions matter:
-        #   - `!active?`: the session is dead (e.g. killed server-side)
-        #   - `@needs_reconnect`: a previous query failed with a connection
-        #     error and the adapter has flagged itself for replacement, but
-        #     the raw connection object is still present. Without this check,
-        #     `with_raw_connection` would call `verify!` and transparently
-        #     reconnect, running the advisory lock on a different backend.
-        if @raw_connection && (!active? || @needs_reconnect)
+        # from reconnecting on a different backend.
+        #
+        # Two cases to guard against:
+        #   1. `@raw_connection` present but `!active?` or `@needs_reconnect`:
+        #      the session is dead or flagged for replacement, but the adapter
+        #      object still holds the raw connection. Without this check,
+        #      `with_raw_connection` would call `verify!` and transparently
+        #      reconnect, running the advisory lock on a different backend.
+        #   2. `@raw_connection` absent but `@needs_reconnect`:
+        #      `disconnect!` was called (or the connection was never
+        #      established) AND a previous query failed with a connection
+        #      error. Without this check, `with_raw_connection` would call
+        #      `connect!` and transparently establish a new session, running
+        #      the advisory lock on a different backend. This is the nested
+        #      get_advisory_lock case: if the session dies while holding
+        #      lock_a, and then get_advisory_lock(lock_b) is called, the new
+        #      session would acquire lock_b (which it should not, because
+        #      lock_a was lost).
+        #
+        # Note: `@raw_connection` absent and `@needs_reconnect == false` is
+        # the normal "not-yet-connected" state: the lock query lazily
+        # establishes the connection (Rails 6 behavior). This is allowed.
+        if @needs_reconnect
+          raise ConnectionNotEstablished, "The connection is not active"
+        end
+        if @raw_connection && !active?
           raise ConnectionNotEstablished, "The connection is not active"
         end
       end

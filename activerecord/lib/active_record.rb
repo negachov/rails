@@ -738,10 +738,15 @@ module ActiveRecord
   # `ensure_advisory_lock_session!` does, to prevent a transparent reconnect
   # on a different backend.
   def self.session_id_of(connection) # :nodoc:
-    # If the connection is flagged for reconnect or inactive, raise rather
-    # than transparently reconnecting (which would run the query on a
-    # different backend and defeat the purpose of recording the session id).
-    if connection.respond_to?(:needs_reconnect?) && (connection.needs_reconnect? || !connection.active?)
+    # If the connection is flagged for reconnect, raise rather than
+    # transparently reconnecting (which would run the query on a different
+    # backend and defeat the purpose of recording the session id). Same
+    # conditions as ensure_advisory_lock_session!.
+    if connection.respond_to?(:needs_reconnect?) && connection.needs_reconnect?
+      raise ConnectionNotEstablished, "The connection is not active"
+    end
+    if connection.respond_to?(:active?) && connection.respond_to?(:connected?) &&
+       connection.connected? && !connection.active?
       raise ConnectionNotEstablished, "The connection is not active"
     end
 
