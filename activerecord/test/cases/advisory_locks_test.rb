@@ -244,7 +244,7 @@ class AdvisoryLocksTest < ActiveRecord::TestCase
 
   # -- nested get_advisory_lock --------------------------------------------
 
-  def test_nested_get_advisory_lock_raises_when_needs_reconnect
+  def test_nested_get_advisory_lock_raises_when_session_dies_while_holding_first_lock
     # Nested get_advisory_lock: if the session dies while holding lock_a,
     # and then get_advisory_lock(lock_b) is called, the new session must NOT
     # silently acquire lock_b (which would break mutual exclusion because
@@ -411,16 +411,17 @@ class AdvisoryLocksTest < ActiveRecord::TestCase
     # capture both calls to avoid a "method redefined" warning (defining
     # the singleton method twice would trigger the warning).
     connection = ActiveRecord::Base.lease_connection
-    captured = spy_on_method(connection, :query_value)
 
-    connection.get_advisory_lock(lock_arg)
-    connection.release_advisory_lock(lock_arg)
+    spy_on_method(connection, :query_value) do |captured|
+      connection.get_advisory_lock(lock_arg)
+      connection.release_advisory_lock(lock_arg)
 
-    # Both calls should have been captured with allow_retry: false.
-    assert_equal 2, captured.size, "query_value should have been called twice"
-    captured.each do |call|
-      assert_equal false, call[:kwargs][:allow_retry],
-        "advisory lock methods must pass allow_retry: false to query_value"
+      # Both calls should have been captured with allow_retry: false.
+      assert_equal 2, captured.size, "query_value should have been called twice"
+      captured.each do |call|
+        assert_equal false, call[:kwargs][:allow_retry],
+          "advisory lock methods must pass allow_retry: false to query_value"
+      end
     end
   end
 
@@ -430,16 +431,17 @@ class AdvisoryLocksTest < ActiveRecord::TestCase
     # Verify that the helper passes the timeout option through to
     # acquire_advisory_lock, which then passes it to the adapter.
     connection = ActiveRecord::Base.lease_connection
-    captured = spy_on_method(connection, :get_advisory_lock)
 
-    result = ActiveRecord.with_session_advisory_lock(lock_arg, timeout: 3, connection: connection) { :ok }
-    assert_equal :ok, result
+    spy_on_method(connection, :get_advisory_lock) do |captured|
+      result = ActiveRecord.with_session_advisory_lock(lock_arg, timeout: 3, connection: connection) { :ok }
+      assert_equal :ok, result
 
-    # The timeout should have been passed to the adapter.
-    # MySQL: positional argument (this repo's signature); PG: no timeout.
-    if connection.adapter_name == "Mysql2" || connection.adapter_name == "Trilogy"
-      assert_equal 3, captured.first[:args][1],
-        "timeout should be passed as a positional argument to MySQL's get_advisory_lock"
+      # The timeout should have been passed to the adapter.
+      # MySQL: positional argument (this repo's signature); PG: no timeout.
+      if connection.adapter_name == "Mysql2" || connection.adapter_name == "Trilogy"
+        assert_equal 3, captured.first[:args][1],
+          "timeout should be passed as a positional argument to MySQL's get_advisory_lock"
+      end
     end
   ensure
     connection.release_advisory_lock(lock_arg)
@@ -831,18 +833,25 @@ class AdvisoryLocksTest < ActiveRecord::TestCase
     end
 
     # Spy on a connection method to capture its arguments, delegating to the
-    # original implementation. Returns the captured call log. The singleton
-    # method is automatically removed when the connection object is garbage
-    # collected, and each test re-defines its own spy, so no explicit
-    # restore is needed (and `undef_method` would break subsequent tests).
+    # original implementation. The singleton method is restored in ensure by
+    # removing it so that the inherited (module) method is visible again.
+    # Returns the captured call log.
     def spy_on_method(object, method_name)
-      original = object.method(method_name)
       captured = []
+      # Capture the original unbound method BEFORE defining the spy.
+      original_im = object.class.instance_method(method_name)
       object.define_singleton_method(method_name) do |*args, **kwargs, &block|
         captured << { args: args, kwargs: kwargs }
-        original.call(*args, **kwargs, &block)
+        original_im.bind_call(object, *args, **kwargs, &block)
       end
-      captured
+      begin
+        yield captured
+      ensure
+        # Remove the singleton method so the inherited (module) method is
+        # visible again. This is safe because the method is defined on a
+        # module (DatabaseStatements), not as a singleton method.
+        object.singleton_class.send(:remove_method, method_name)
+      end
     end
 
     # A distinct lock identifier for nested lock tests.

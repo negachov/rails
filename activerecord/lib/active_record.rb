@@ -773,16 +773,20 @@ module ActiveRecord
     lock_lost_reason = nil
 
     # If the session id could not be recorded (e.g. the session died just
-    # after acquisition), we cannot detect a session change. Release the lock
-    # best-effort; if the release fails, the session is gone and the lock was
-    # already dropped server-side, so there is nothing more to do.
+    # after acquisition, or the adapter does not support session id
+    # tracking), we cannot detect a session change. Release the lock and
+    # report any failure the same way as the session-id path below.
     if original_session_id.nil?
       begin
-        connection.release_advisory_lock(lock_name_or_id)
-      rescue ActiveRecord::ConnectionNotEstablished, ActiveRecord::StatementInvalid
-        # The session is gone; the lock was already dropped server-side.
+        released = connection.release_advisory_lock(lock_name_or_id)
+        unless released
+          lock_lost_reason = "lock was not released (session id unavailable)"
+        end
+      rescue ActiveRecord::ConnectionNotEstablished, ActiveRecord::StatementInvalid => e
+        lock_lost_reason = "connection is gone while releasing (#{e.class})"
       end
-      return
+
+      return if lock_lost_reason.nil?
     end
 
     begin
