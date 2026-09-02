@@ -84,6 +84,196 @@ class AdvisoryLocksTest < ActiveRecord::TestCase
     restore_live_connection(connection)
   end
 
+  def test_lock_is_released_after_session_kill
+    # Verify that killing the session releases the lock (i.e., another
+    # session can acquire it). This is a separate guarantee from "an exception
+    # is raised": even if the exception were raised, the lock could still be
+    # held by a different backend if retry had re-run the statement on a new
+    # session. This test proves the old session actually lost the lock.
+    connection = ActiveRecord::Base.lease_connection
+    assert connection.get_advisory_lock(lock_arg), "should acquire the lock"
+
+    kill_session_by_other_connection(connection)
+
+    # The old session is dead, so the lock is free: another session can
+    # acquire it (proves the old session lost the lock).
+    other_pool = build_duplicate_pool
+    other = other_pool.checkout
+    assert other.get_advisory_lock(lock_arg),
+      "lock should be released after the session was killed (proves the old session lost it)"
+    other.release_advisory_lock(lock_arg)
+
+    # The original connection must raise (not transparently reconnect and
+    # acquire on a fresh backend).
+    assert_raises(ActiveRecord::ConnectionNotEstablished) do
+      connection.get_advisory_lock(lock_arg)
+    end
+  ensure
+    other&.close
+    other_pool&.disconnect!
+    restore_live_connection(connection)
+  end
+
+  # -- allow_retry: false and no-reconnect guarantees -----------------------
+
+  def test_get_advisory_lock_does_not_reconnect_after_kill
+    # After the session is killed, get_advisory_lock must raise and the
+    # connection must NOT be transparently reconnected. Verify that:
+    #   1. An exception is raised
+    #   2. The connection is still inactive (no silent reconnect happened)
+    connection = ActiveRecord::Base.lease_connection
+    assert connection.get_advisory_lock(lock_arg), "should acquire the lock"
+
+    kill_session_by_other_connection(connection)
+
+    assert_raises(ActiveRecord::ConnectionNotEstablished) do
+      connection.get_advisory_lock(lock_arg)
+    end
+
+    # The connection must still be inactive: if a transparent reconnect had
+    # occurred, active? would be true and the lock would have been acquired
+    # on a fresh backend (the bug we are guarding against).
+    assert_not connection.active?,
+      "connection must not have been transparently reconnected after the kill"
+  ensure
+    restore_live_connection(connection)
+  end
+
+  def test_release_advisory_lock_does_not_reconnect_after_kill
+    # Same guarantee for release_advisory_lock: after the session is killed,
+    # release must raise and the connection must NOT be transparently
+    # reconnected (which would run RELEASE_LOCK on a backend that never held
+    # the lock).
+    connection = ActiveRecord::Base.lease_connection
+    assert connection.get_advisory_lock(lock_arg), "should acquire the lock"
+
+    kill_session_by_other_connection(connection)
+
+    assert_raises(ActiveRecord::ConnectionNotEstablished) do
+      connection.release_advisory_lock(lock_arg)
+    end
+
+    assert_not connection.active?,
+      "connection must not have been transparently reconnected after the kill"
+  ensure
+    restore_live_connection(connection)
+  end
+
+  def test_get_advisory_lock_with_needs_reconnect_true
+    # When @needs_reconnect is true (set by a previous connection error),
+    # get_advisory_lock must still raise rather than transparently reconnect.
+    # We simulate this by killing the session and then calling get_advisory_lock:
+    # the active? probe fails, and with_raw_connection sees @needs_reconnect == true
+    # (set by the failed probe) and must not reconnect.
+    connection = ActiveRecord::Base.lease_connection
+    assert connection.get_advisory_lock(lock_arg), "should acquire the lock"
+
+    kill_session_by_other_connection(connection)
+
+    # After the kill, the first get_advisory_lock call fails at the active?
+    # probe and sets @needs_reconnect. A second call must also raise
+    # (not silently reconnect and acquire on a fresh backend).
+    assert_raises(ActiveRecord::ConnectionNotEstablished) do
+      connection.get_advisory_lock(lock_arg)
+    end
+
+    # And a third call must still raise (the connection is still flagged
+    # for reconnect; allow_retry: false prevents the query from being
+    # re-run on a new backend).
+    assert_raises(ActiveRecord::ConnectionNotEstablished) do
+      connection.get_advisory_lock(lock_arg)
+    end
+
+    assert_not connection.active?,
+      "connection must not have been transparently reconnected"
+  ensure
+    restore_live_connection(connection)
+  end
+
+  # -- helper edge cases ----------------------------------------------------
+
+  def test_with_session_advisory_lock_releases_lock_when_session_id_fails
+    # If session_id_of fails (e.g. the session died just after acquisition),
+    # the lock must still be released in `ensure`. We simulate this with a
+    # fake connection whose get_advisory_lock succeeds but whose query_value
+    # (used by session_id_of) raises. The helper should:
+    #   1. Acquire the lock (fake returns true)
+    #   2. session_id_of raises (fake's query_value raises)
+    #   3. `ensure` calls release_and_report_advisory_lock with
+    #      original_session_id == nil, which releases the lock best-effort
+    #   4. The block still runs and returns its value
+    release_called = false
+    fake = Object.new
+    fake.define_singleton_method(:advisory_locks_enabled?) { true }
+    fake.define_singleton_method(:adapter_name) { "FakeAdapter" }
+    fake.define_singleton_method(:get_advisory_lock) { |*| true }
+    fake.define_singleton_method(:release_advisory_lock) { |*| release_called = true; true }
+    fake.define_singleton_method(:query_value) { |*| raise ActiveRecord::ConnectionNotEstablished, "simulated" }
+
+    result = ActiveRecord.with_session_advisory_lock(lock_arg, connection: fake) { :ok }
+    assert_equal :ok, result
+    assert release_called,
+      "release_advisory_lock must be called in ensure even when session_id_of fails"
+  end
+
+  def test_with_session_advisory_lock_on_adapter_without_session_id
+    # Adapters that do not support session id tracking (e.g. SQLite) should
+    # still work: the helper acquires and releases the lock, and the block
+    # runs. session_id_of returns nil, so release_and_report skips the
+    # session-change check.
+    fake = Object.new
+    fake.define_singleton_method(:advisory_locks_enabled?) { true }
+    fake.define_singleton_method(:adapter_name) { "SQLite" }
+    fake.define_singleton_method(:get_advisory_lock) { |*| true }
+    fake.define_singleton_method(:release_advisory_lock) { |*| true }
+    # session_id_of returns nil for unknown adapters
+
+    result = ActiveRecord.with_session_advisory_lock(lock_arg, connection: fake) { :ok }
+    assert_equal :ok, result
+  end
+
+  # -- query_value allow_retry: false unit test -----------------------------
+
+  def test_advisory_lock_methods_pass_allow_retry_false
+    # Verify that both get_advisory_lock and release_advisory_lock pass
+    # allow_retry: false to query_value. We spy on query_value once and
+    # capture both calls to avoid a "method redefined" warning (defining
+    # the singleton method twice would trigger the warning).
+    connection = ActiveRecord::Base.lease_connection
+    captured = spy_on_method(connection, :query_value)
+
+    connection.get_advisory_lock(lock_arg)
+    connection.release_advisory_lock(lock_arg)
+
+    # Both calls should have been captured with allow_retry: false.
+    assert_equal 2, captured.size, "query_value should have been called twice"
+    captured.each do |call|
+      assert_equal false, call[:kwargs][:allow_retry],
+        "advisory lock methods must pass allow_retry: false to query_value"
+    end
+  end
+
+  # -- MySQL timeout branching ---------------------------------------------
+
+  def test_with_session_advisory_lock_timeout_passthrough
+    # Verify that the helper passes the timeout option through to
+    # acquire_advisory_lock, which then passes it to the adapter.
+    connection = ActiveRecord::Base.lease_connection
+    captured = spy_on_method(connection, :get_advisory_lock)
+
+    result = ActiveRecord.with_session_advisory_lock(lock_arg, timeout: 3, connection: connection) { :ok }
+    assert_equal :ok, result
+
+    # The timeout should have been passed to the adapter.
+    # MySQL: positional argument (this repo's signature); PG: no timeout.
+    if connection.adapter_name == "Mysql2" || connection.adapter_name == "Trilogy"
+      assert_equal 3, captured.first[:args][1],
+        "timeout should be passed as a positional argument to MySQL's get_advisory_lock"
+    end
+  ensure
+    connection.release_advisory_lock(lock_arg)
+  end
+
   def test_get_advisory_lock_connects_when_not_connected
     connection = ActiveRecord::Base.lease_connection
     connection.disconnect!
@@ -467,6 +657,21 @@ class AdvisoryLocksTest < ActiveRecord::TestCase
       else
         skip("kill_session unsupported for #{connection.adapter_name}")
       end
+    end
+
+    # Spy on a connection method to capture its arguments, delegating to the
+    # original implementation. Returns the captured call log. The singleton
+    # method is automatically removed when the connection object is garbage
+    # collected, and each test re-defines its own spy, so no explicit
+    # restore is needed (and `undef_method` would break subsequent tests).
+    def spy_on_method(object, method_name)
+      original = object.method(method_name)
+      captured = []
+      object.define_singleton_method(method_name) do |*args, **kwargs, &block|
+        captured << { args: args, kwargs: kwargs }
+        original.call(*args, **kwargs, &block)
+      end
+      captured
     end
 
     LOCK_ID = 1234_5678

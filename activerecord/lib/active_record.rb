@@ -701,35 +701,45 @@ module ActiveRecord
 
     return yield unless connection.advisory_locks_enabled?
 
-    unless acquire_advisory_lock(connection, lock_name_or_id, timeout)
-      raise AdvisoryLockAcquisitionFailed.new(
-        "could not acquire advisory lock #{lock_name_or_id.inspect}"
-      )
-    end
-
-    original_session_id = session_id_of(connection)
-
+    acquired = false
+    original_session_id = nil
     propagating = nil
     begin
+      unless acquire_advisory_lock(connection, lock_name_or_id, timeout)
+        raise AdvisoryLockAcquisitionFailed.new(
+          "could not acquire advisory lock #{lock_name_or_id.inspect}"
+        )
+      end
+      acquired = true
+
+      # Record the session id to detect a transparent reconnect between
+      # acquisition and release. If this query fails (e.g. the session died
+      # just after acquisition), we must still release the lock in `ensure`.
+      original_session_id = session_id_of(connection)
+
       yield
     rescue Exception => raised_error # rubocop:disable Lint/RescueException
       propagating = raised_error
       raise
-    end
-  ensure
-    if original_session_id
-      release_and_report_advisory_lock(
-        connection, lock_name_or_id, original_session_id, propagating
-      )
+    ensure
+      if acquired
+        release_and_report_advisory_lock(
+          connection, lock_name_or_id, original_session_id, propagating
+        )
+      end
     end
   end
 
+  # NOTE: `allow_retry: false` prevents the session-id query from
+  # transparently reconnecting on a different backend. Without this, a dead
+  # session would be re-established and the query would succeed on a new
+  # backend, defeating the purpose of recording the session id.
   def self.session_id_of(connection) # :nodoc:
     case connection.adapter_name
     when "Mysql2", "Trilogy"
-      connection.query_value("SELECT CONNECTION_ID()")
+      connection.query_value("SELECT CONNECTION_ID()", nil, allow_retry: false)
     when "PostgreSQL"
-      connection.query_value("SELECT pg_backend_pid()")
+      connection.query_value("SELECT pg_backend_pid()", nil, allow_retry: false)
     end
   end
 
@@ -744,6 +754,19 @@ module ActiveRecord
 
   def self.release_and_report_advisory_lock(connection, lock_name_or_id, original_session_id, propagating) # :nodoc:
     lock_lost_reason = nil
+
+    # If the session id could not be recorded (e.g. the session died just
+    # after acquisition), we cannot detect a session change. Release the lock
+    # best-effort; if the release fails, the session is gone and the lock was
+    # already dropped server-side, so there is nothing more to do.
+    if original_session_id.nil?
+      begin
+        connection.release_advisory_lock(lock_name_or_id)
+      rescue ActiveRecord::ConnectionNotEstablished, ActiveRecord::StatementInvalid
+        # The session is gone; the lock was already dropped server-side.
+      end
+      return
+    end
 
     begin
       current_session_id = session_id_of(connection)
