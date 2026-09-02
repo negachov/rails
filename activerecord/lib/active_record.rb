@@ -730,11 +730,21 @@ module ActiveRecord
     end
   end
 
-  # NOTE: `allow_retry: false` prevents the session-id query from
-  # transparently reconnecting on a different backend. Without this, a dead
-  # session would be re-established and the query would succeed on a new
-  # backend, defeating the purpose of recording the session id.
+  # NOTE: `allow_retry: false` prevents the session-id query from being
+  # re-run on a different backend after a connection error. However, it does
+  # NOT prevent the pre-execution `connect!` / `verify!` calls in
+  # `with_raw_connection` from reconnecting. We therefore check the
+  # connection state before calling `query_value`, the same way
+  # `ensure_advisory_lock_session!` does, to prevent a transparent reconnect
+  # on a different backend.
   def self.session_id_of(connection) # :nodoc:
+    # If the connection is flagged for reconnect or inactive, raise rather
+    # than transparently reconnecting (which would run the query on a
+    # different backend and defeat the purpose of recording the session id).
+    if connection.respond_to?(:needs_reconnect?) && (connection.needs_reconnect? || !connection.active?)
+      raise ConnectionNotEstablished, "The connection is not active"
+    end
+
     case connection.adapter_name
     when "Mysql2", "Trilogy"
       connection.query_value("SELECT CONNECTION_ID()", nil, allow_retry: false)
