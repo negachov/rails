@@ -187,6 +187,10 @@ module ActiveRecord
         @advisory_locks_enabled = self.class.type_cast_config_to_boolean(
           @config.fetch(:advisory_locks, true)
         )
+        # Only locks acquired through the adapter API are tracked. Callers that
+        # manipulate advisory locks with raw SQL are responsible for keeping
+        # that session state consistent.
+        @advisory_locks_held = Hash.new(0)
 
         @sql_notifications = self.class.type_cast_config_to_boolean(
           @config.fetch(:sql_notifications, true)
@@ -356,6 +360,10 @@ module ActiveRecord
             enable_lazy_transactions!
             unset_query_cache!
           end
+
+          # Keep a lost advisory-lock session unusable for the remainder of
+          # its lease, but allow the next lease to reconnect and recover.
+          @advisory_locks_held.clear if @needs_reconnect
         else
           raise ActiveRecordError, "Cannot expire connection, it is not currently leased."
         end
@@ -682,39 +690,56 @@ module ActiveRecord
         supports_advisory_locks? && @advisory_locks_enabled
       end
 
-      def ensure_advisory_lock_session! # :nodoc:
-        # Raise BEFORE any transparent reconnect can occur. `allow_retry: false`
-        # only prevents re-running a failed query; it does NOT prevent the
-        # pre-execution `connect!` / `verify!` calls in `with_raw_connection`
-        # from reconnecting on a different backend.
-        #
-        # Two cases to guard against:
-        #   1. `@raw_connection` present but `!active?` or `@needs_reconnect`:
-        #      the session is dead or flagged for replacement, but the adapter
-        #      object still holds the raw connection. Without this check,
-        #      `with_raw_connection` would call `verify!` and transparently
-        #      reconnect, running the advisory lock on a different backend.
-        #   2. `@raw_connection` absent but `@needs_reconnect`:
-        #      `disconnect!` was called (or the connection was never
-        #      established) AND a previous query failed with a connection
-        #      error. Without this check, `with_raw_connection` would call
-        #      `connect!` and transparently establish a new session, running
-        #      the advisory lock on a different backend. This is the nested
-        #      get_advisory_lock case: if the session dies while holding
-        #      lock_a, and then get_advisory_lock(lock_b) is called, the new
-        #      session would acquire lock_b (which it should not, because
-        #      lock_a was lost).
-        #
-        # Note: `@raw_connection` absent and `@needs_reconnect == false` is
-        # the normal "not-yet-connected" state: the lock query lazily
-        # establishes the connection (Rails 6 behavior). This is allowed.
-        if @needs_reconnect
-          raise ConnectionNotEstablished, "The connection is not active"
+      def ensure_advisory_lock_session!(allow_reconnect: false) # :nodoc:
+        # A known session loss may only be recovered before acquiring the first
+        # lock. Once a lock is held, it must surface instead of running the lock
+        # operation on a different session.
+        if @needs_reconnect || (@raw_connection && !active?)
+          if allow_reconnect && reconnect_can_restore_state?
+            reconnect!(restore_transactions: true)
+          else
+            raise_advisory_lock_connection_error!
+          end
+        else
+          connect! unless connected?
         end
-        if @raw_connection && !active?
-          raise ConnectionNotEstablished, "The connection is not active"
+
+        # Materializing a lazy transaction issues a retryable BEGIN. Mark the
+        # transaction non-restorable before that can happen.
+        dirty_current_transaction
+      end
+
+      def advisory_lock_acquired!(lock_id) # :nodoc:
+        @advisory_locks_held[lock_id] += 1
+      end
+
+      def advisory_lock_released!(lock_id) # :nodoc:
+        case @advisory_locks_held[lock_id]
+        when 0
+          nil
+        when 1
+          @advisory_locks_held.delete(lock_id)
+        else
+          @advisory_locks_held[lock_id] -= 1
         end
       end
+
+      def advisory_locks_held? # :nodoc:
+        @advisory_locks_held.any?
+      end
+
+      def raise_advisory_lock_connection_error! # :nodoc:
+        @needs_reconnect = true
+        message = if advisory_locks_held?
+          "The connection is not active, and held advisory locks cannot be restored on a new connection"
+        else
+          "The connection is not active"
+        end
+        raise ConnectionNotEstablished.new(message, connection_pool: @pool)
+      end
+
+      private :ensure_advisory_lock_session!, :advisory_lock_acquired!, :advisory_lock_released!,
+        :advisory_locks_held?, :raise_advisory_lock_connection_error!
 
       # This is meant to be implemented by the adapters that support advisory
       # locks
@@ -779,6 +804,7 @@ module ActiveRecord
           attempt_configure_connection do
             @allow_preconnect = false
 
+            @advisory_locks_held.clear
             reconnect
             @needs_reconnect = false
 
@@ -816,6 +842,7 @@ module ActiveRecord
         @lock.synchronize do
           clear_cache!(new_connection: true)
           reset_transaction
+          @advisory_locks_held.clear
           @raw_connection_dirty = false
           @connected_since = nil
           @last_activity = nil
@@ -831,7 +858,7 @@ module ActiveRecord
       # undefined. This is called internally just before a forked process gets
       # rid of a connection that belonged to its parent.
       def discard!
-        # This should be overridden by concrete adapters.
+        @advisory_locks_held.clear
       end
 
       # Reset the state of this connection, directing the DBMS to clear
@@ -846,6 +873,7 @@ module ActiveRecord
         attempt_configure_connection do
           clear_cache!(new_connection: true)
           reset_transaction
+          @advisory_locks_held.clear
           configure_connection
         end
       end
@@ -882,10 +910,15 @@ module ActiveRecord
 
       # Checks whether the connection to the database is still active (i.e. not stale).
       # This is done under the hood by calling #active?. If the connection
-      # is no longer active, then this method will reconnect to the database.
+      # is no longer active, then this method will reconnect to the database,
+      # unless doing so would silently discard a held advisory lock.
       def verify!
         if @needs_reconnect || !active?
           @lock.synchronize do
+            if advisory_locks_held?
+              raise_advisory_lock_connection_error!
+            end
+
             if @unconfigured_connection
               attempt_configure_connection do
                 @raw_connection = @unconfigured_connection
@@ -1087,7 +1120,9 @@ module ActiveRecord
 
       private
         def reconnect_can_restore_state?
-          transaction_manager.restorable? && !@raw_connection_dirty
+          # Advisory locks are session state and cannot be restored on a new
+          # connection.
+          !advisory_locks_held? && transaction_manager.restorable? && !@raw_connection_dirty
         end
 
         # Lock the monitor, ensure we're properly connected and

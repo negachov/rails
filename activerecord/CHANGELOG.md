@@ -1,36 +1,17 @@
-*   Raise an error when an advisory lock's session is lost, and add a helper
-    that detects a lock silently dropped when the connection is re-established
-    on a different backend.
+*   Do not transparently reconnect when acquiring or releasing an advisory
+    lock after its database session is lost.
 
-    Advisory locks are scoped to the database session, not the Rails adapter
-    object. If the session was lost while the lock was held, the next advisory
-    lock call could be transparently (re)connected and acquire/release the lock
-    on a *different* backend, silently breaking the mutual exclusion the lock
-    is supposed to provide. This is fixed in three layers:
+    Advisory locks belong to a database session. Once a lock is held,
+    `get_advisory_lock` and `release_advisory_lock` now raise a connection error
+    instead of reconnecting and running the lock operation on a different
+    session. While a lock acquired through `get_advisory_lock` is held, other
+    queries on the same connection also raise instead of reconnecting without
+    the lock. A connection with no held advisory locks and no other
+    non-restorable state can reconnect before acquiring its first lock.
 
-    * `get_advisory_lock` and `release_advisory_lock` no longer retry on a
-      connection error: they pass `allow_retry: false` to `query_value` (which
-      defaults to `allow_retry: true`), so a statement that fails is not
-      re-run on a *new* backend.
-    * Both methods probe the session (`active?`) before running the lock call
-      and raise `ConnectionNotEstablished` if the session is gone, restoring
-      the Rails 6 behavior where a lost connection surfaces to the caller
-      instead of being silently re-established. A not-yet-established
-      connection is unaffected and connects lazily, like any other first query.
-    * `ActiveRecord.with_session_advisory_lock(lock_name_or_id) { ... }` records
-      the server-side session identifier (`pg_backend_pid` / `CONNECTION_ID`)
-      when the lock is acquired and verifies it is still the same when the
-      lock is released. This catches the case the adapter-level guard cannot:
-      a *normal* query (not an advisory lock call) reconnecting while the lock
-      is held. If the session changed, the helper raises `AdvisoryLockLost` so
-      the caller knows the critical section did not run under a held lock.
-
-    The helper raises `AdvisoryLockAcquisitionFailed` when the lock cannot be
-    acquired, yields without locking on adapters where advisory locks are
-    unsupported or disabled (`advisory_locks: false`), and accepts `timeout:`
-    (MySQL) and `connection:` (multi-database) options. A lost lock never masks
-    an exception already propagating from the block: in that case it is logged
-    as a warning instead of being raised.
+    If a migration and its advisory lock release both fail, the migrator now
+    preserves the migration's original exception. A release failure after a
+    successful migration still raises `ConcurrentMigrationError`.
 
     *Mutsutoshi Yoshimoto*
 

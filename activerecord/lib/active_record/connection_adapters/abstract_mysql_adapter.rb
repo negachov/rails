@@ -192,25 +192,24 @@ module ActiveRecord
         end
       end
 
-      # NOTE: Two layers of defense (see AbstractAdapter#ensure_advisory_lock_session!):
-      #   1. `ensure_advisory_lock_session!` raises if the session is already
-      #      dead (prevents a transparent reconnect before the query runs).
-      #   2. `allow_retry: false` prevents the query from being re-run on a new
-      #      backend if a connection error occurs *during* the query. In
-      #      practice, layer 1 raises first, so layer 2 is a safety net for
-      #      the (unlikely) case where the session dies between the probe and
-      #      the query execution. Both layers together guarantee that a lost
-      #      session never silently acquires/releases the lock on a different
-      #      backend.
       def get_advisory_lock(lock_name, timeout = 0) # :nodoc:
-        ensure_advisory_lock_session!
-        query_value("SELECT GET_LOCK(#{quote(lock_name.to_s)}, #{timeout})", nil, allow_retry: false, materialize_transactions: true) == 1
+        lock_name = lock_name.to_s
+        @lock.synchronize do
+          ensure_advisory_lock_session!(allow_reconnect: true)
+          acquired = query_value("SELECT GET_LOCK(#{quote(lock_name)}, #{timeout})", nil, allow_retry: false, materialize_transactions: true) == 1
+          advisory_lock_acquired!(lock_name) if acquired
+          acquired
+        end
       end
 
-      # NOTE: Same two-layer defense as get_advisory_lock (see above).
       def release_advisory_lock(lock_name) # :nodoc:
-        ensure_advisory_lock_session!
-        query_value("SELECT RELEASE_LOCK(#{quote(lock_name.to_s)})", nil, allow_retry: false, materialize_transactions: true) == 1
+        lock_name = lock_name.to_s
+        @lock.synchronize do
+          ensure_advisory_lock_session!
+          released = query_value("SELECT RELEASE_LOCK(#{quote(lock_name)})", nil, allow_retry: false, materialize_transactions: true) == 1
+          advisory_lock_released!(lock_name) if released
+          released
+        end
       end
 
       def index_algorithms
